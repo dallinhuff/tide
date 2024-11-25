@@ -1,0 +1,25 @@
+[package]
+name = "tide"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tide"
+path = "src/lib/lib.rs"
+
+[[bin]]
+name = "tyde-server"
+path = "src/bin/server/main.rs"
+
+[dependencies]
+anyhow = "1.0.93"
+axum = "0.7.9"
+chrono = "0.4.38"
+dotenv = "0.15.0"
+serde = { version = "1.0.215", features = ["std", "derive"] }
+sqlx = { version = "0.8.2", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
+thiserror = "2.0.3"
+tokio = { version = "1.41.1", features = ["full"] }
+tower-http = { version = "0.6.2", features = ["trace"] }
+tracing = "0.1.40"
+uuid = { version = "1.11.0", features = ["v7", "fast-rng", "macro-diagnostics", "serde"] }

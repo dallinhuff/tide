@@ -1,5 +1,6 @@
 use crate::domain::booking::models::booking::*;
 use crate::domain::booking::models::customer::*;
+use crate::domain::booking::models::equipment::*;
 use crate::domain::booking::models::trip::*;
 use crate::domain::booking::models::waiver::*;
 use crate::domain::booking::ports::BookingRepository;
@@ -8,85 +9,6 @@ use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{query, query_as, FromRow, QueryBuilder};
 use std::collections::HashMap;
 use uuid::Uuid;
-
-#[derive(FromRow, Debug)]
-struct BookingDto {
-    booking_id: Uuid,
-    customer_id: Uuid,
-    trip_id: Uuid,
-    participant_id: Uuid,
-    name: String,
-    dob: NaiveDate,
-    notes: String,
-    waiver_id: Option<Uuid>,
-}
-
-struct CustomerDto {
-    customer_id: Uuid,
-    name: String,
-    email: String,
-    phone: String,
-}
-
-impl From<CustomerDto> for Customer {
-    fn from(dto: CustomerDto) -> Self {
-        Self {
-            id: CustomerId(dto.customer_id),
-            name: CustomerName(dto.name),
-            email: EmailAddress(dto.email),
-            phone: PhoneNumber(dto.phone),
-        }
-    }
-}
-
-#[derive(FromRow, Debug)]
-struct TripDto {
-    trip_id: Uuid,
-    trip_kind_id: Uuid,
-    name: String,
-    description: String,
-    guided: bool,
-    meal_provided: bool,
-    location_id: Uuid,
-    start_time: DateTime<Utc>,
-    end_time: DateTime<Utc>,
-}
-
-impl From<TripDto> for Trip {
-    fn from(dto: TripDto) -> Self {
-        Self {
-            id: TripId(dto.trip_id),
-            kind: TripKind {
-                id: TripKindId(dto.trip_kind_id),
-                name: dto.name,
-                description: dto.description,
-                guided: dto.guided,
-                meal_provided: dto.meal_provided,
-            },
-            location: LocationId(dto.location_id),
-            start_time: dto.start_time,
-            end_time: dto.end_time,
-        }
-    }
-}
-
-impl From<sqlx::Error> for BookingError {
-    fn from(error: sqlx::Error) -> Self {
-        Self::Unknown(error.into())
-    }
-}
-
-impl From<sqlx::Error> for CustomerError {
-    fn from(error: sqlx::Error) -> Self {
-        Self::Unknown(error.into())
-    }
-}
-
-impl From<sqlx::Error> for TripError {
-    fn from(error: sqlx::Error) -> Self {
-        Self::Unknown(error.into())
-    }
-}
 
 impl BookingRepository for Postgres {
     async fn find_booking(&self, id: BookingId) -> Result<Option<Booking>, BookingError> {
@@ -156,7 +78,7 @@ impl BookingRepository for Postgres {
             WHERE TRUE
         ";
 
-        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(query);
+        let mut qb = QueryBuilder::<sqlx::Postgres>::new(query);
 
         if let Some(CustomerId(id)) = filters.customer {
             qb.push(" AND customer_id = ").push_bind(id);
@@ -213,7 +135,11 @@ impl BookingRepository for Postgres {
             query!(
                 // language=postgresql
                 "INSERT INTO booking (booking_id, customer_id, trip_id)
-                 VALUES ($1, $2, $3)",
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (booking_id)
+                 DO UPDATE SET
+                    customer_id = EXCLUDED.customer_id,
+                    trip_id = EXCLUDED.trip_id",
                 booking.id.0,
                 booking.customer.0,
                 booking.trip.0
@@ -262,6 +188,11 @@ impl BookingRepository for Postgres {
             query!(
                 // language=postgresql
                 "DELETE FROM booking_participant WHERE booking_id = $1",
+                id.0
+            ),
+            query!(
+                // language=postgresql
+                "DELETE FROM booking_equipment WHERE booking_id = $1",
                 id.0
             ),
             query!(
@@ -337,7 +268,7 @@ impl BookingRepository for Postgres {
             // TODO: should return error
             return Ok(vec![]);
         }
-        
+
         // language=postgresql
         let query = "
             SELECT *
@@ -361,21 +292,185 @@ impl BookingRepository for Postgres {
         }
 
         let result = qb.build_query_as::<TripDto>().fetch_all(&self.pool).await?;
-        
+
         Ok(result.into_iter().map(Trip::from).collect())
+    }
+
+    async fn find_booking_rentals(
+        &self,
+        booking_id: BookingId,
+    ) -> Result<BookingRentals, EquipmentError> {
+        let result = query_as!(
+            RentalDto,
+            // language=postgresql
+            "SELECT equipment_id, quantity
+             FROM booking_equipment
+             WHERE booking_id = $1",
+            booking_id.0
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut rentals = HashMap::<EquipmentId, i32>::with_capacity(result.len());
+        for dto in result {
+            let equipment_id = EquipmentId(dto.equipment_id);
+            if let Some(count) = rentals.get_mut(&equipment_id) {
+                *count += dto.quantity;
+            } else {
+                rentals.insert(equipment_id, dto.quantity);
+            }
+        }
+
+        Ok(BookingRentals {
+            booking_id,
+            rentals,
+        })
+    }
+
+    async fn save_booking_rentals(
+        &self,
+        booking_rentals: &BookingRentals,
+    ) -> Result<(), EquipmentError> {
+        let (equipment_ids, quantities) = &rentals_to_tuples(&booking_rentals.rentals);
+
+        let mut txn = self.pool.begin().await?;
+        for command in [
+            query!(
+                // language=postgresql
+                "DELETE FROM booking_equipment WHERE booking_id = $1",
+                booking_rentals.booking_id.0
+            ),
+            query!(
+                // language=postgresql
+                "INSERT INTO booking_equipment (booking_id, equipment_id, quantity)
+                 SELECT * FROM UNNEST($1::UUID[], $2::UUID[], $3::INT[])",
+                &vec![booking_rentals.booking_id.0; equipment_ids.len()],
+                equipment_ids,
+                quantities
+            ),
+        ] {
+            command.execute(&mut *txn).await?;
+        }
+        txn.commit().await?;
+
+        Ok(())
+    }
+}
+
+#[derive(FromRow, Debug)]
+struct BookingDto {
+    booking_id: Uuid,
+    customer_id: Uuid,
+    trip_id: Uuid,
+    participant_id: Uuid,
+    name: String,
+    dob: NaiveDate,
+    notes: String,
+    waiver_id: Option<Uuid>,
+}
+
+struct CustomerDto {
+    customer_id: Uuid,
+    name: String,
+    email: String,
+    phone: String,
+}
+
+impl From<CustomerDto> for Customer {
+    fn from(dto: CustomerDto) -> Self {
+        Self {
+            id: CustomerId(dto.customer_id),
+            name: CustomerName(dto.name),
+            email: EmailAddress(dto.email),
+            phone: PhoneNumber(dto.phone),
+        }
+    }
+}
+
+#[derive(FromRow, Debug)]
+struct TripDto {
+    trip_id: Uuid,
+    trip_kind_id: Uuid,
+    name: String,
+    description: String,
+    guided: bool,
+    meal_provided: bool,
+    location_id: Uuid,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+}
+
+impl From<TripDto> for Trip {
+    fn from(dto: TripDto) -> Self {
+        Self {
+            id: TripId(dto.trip_id),
+            kind: TripKind {
+                id: TripKindId(dto.trip_kind_id),
+                name: dto.name,
+                description: dto.description,
+                guided: dto.guided,
+                meal_provided: dto.meal_provided,
+            },
+            location: LocationId(dto.location_id),
+            start_time: dto.start_time,
+            end_time: dto.end_time,
+        }
+    }
+}
+
+struct RentalDto {
+    equipment_id: Uuid,
+    quantity: i32,
+}
+
+impl From<sqlx::Error> for BookingError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Unknown(error.into())
+    }
+}
+
+impl From<sqlx::Error> for CustomerError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Unknown(error.into())
+    }
+}
+
+impl From<sqlx::Error> for TripError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Unknown(error.into())
+    }
+}
+
+impl From<sqlx::Error> for EquipmentError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Unknown(error.into())
     }
 }
 
 fn participants_to_tuples(
     participants: &Vec<Participant>,
 ) -> (Vec<Uuid>, Vec<String>, Vec<NaiveDate>, Vec<String>) {
-    participants
-        .iter()
-        .fold((vec![], vec![], vec![], vec![]), |mut acc, participant| {
-            acc.0.push(participant.id.0);
-            acc.1.push(participant.name.to_string());
-            acc.2.push(participant.dob);
-            acc.3.push(participant.notes.to_string());
-            acc
-        })
+    participants.iter().fold(
+        (vec![], vec![], vec![], vec![]),
+        |(mut ids, mut names, mut dobs, mut notes), participant| {
+            ids.push(participant.id.0);
+            names.push(participant.name.to_string());
+            dobs.push(participant.dob);
+            notes.push(participant.notes.to_string());
+
+            (ids, names, dobs, notes)
+        },
+    )
+}
+
+fn rentals_to_tuples(rentals: &HashMap<EquipmentId, i32>) -> (Vec<Uuid>, Vec<i32>) {
+    rentals.iter().fold(
+        (vec![], vec![]),
+        |(mut equipment_ids, mut quantities), (equipment_id, quantity)| {
+            equipment_ids.push(equipment_id.0);
+            quantities.push(*quantity);
+
+            (equipment_ids, quantities)
+        },
+    )
 }

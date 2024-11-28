@@ -22,5 +22,9 @@ pub struct EquipmentDescription(pub String);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BookingRentals {
     pub booking_id: BookingId,
-    pub rentals: HashMap<EquipmentId, u8>
+    pub rentals: HashMap<EquipmentId, i32>
+}
+
+pub enum EquipmentError {
+    Unknown(anyhow::Error),
 }
